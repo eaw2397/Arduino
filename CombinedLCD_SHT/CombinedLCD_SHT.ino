@@ -9,10 +9,29 @@
  */
 
 #include <SHT1x.h>
+#include <SPI.h>
+#include <Ethernet.h>
 
-// Specify data and clock connections 
-#define dataPin  10
-#define clockPin 11
+// MAC address for ethernet shield
+byte mac[] = {
+  0x00, 0xAA, 0xBB, 0xCC, 0xDE, 0x02
+};
+
+/////////////////
+// Phant Stuff //
+/////////////////
+const String publicKey = "ZGbp5l6VpptqGX017QgR";
+const String privateKey = "2mpx8EqBxxH9bxEJrqKe";
+const byte NUM_FIELDS = 2;
+const String fieldNames[NUM_FIELDS] = {"temp", "humidity"};
+String fieldData[NUM_FIELDS];
+char server[] = "data.sparkfun.com"; 
+long prevTime = 0;
+
+
+// SHT11 pins
+#define dataPin  2
+#define clockPin 4
 
 // LCD Pins
 #define PIN_SCE   7
@@ -131,14 +150,32 @@ static const byte ASCII[][5] =
 // instantiate SHT1x object
 SHT1x sht1x(dataPin, clockPin);
 
+// Create the ethernet client
+EthernetClient client;
+
+union IPAddressConverter {
+ uint32_t ipInteger;
+ uint8_t ipArray[4];
+};
+
 void setup()
 {
+  IPAddressConverter ipAddress;
   Serial.begin(38400); // Open serial connection to report values to host
   Serial.println("Starting up");
+  if (Ethernet.begin(mac) == 0) {
+    Serial.println("Failed to configure Ethernet using DHCP");
+  }
+  Serial.println(Ethernet.localIP());
   LcdInitialise();
   LcdClear();
-  LcdString("Starting");
+  ipAddress.ipInteger = Ethernet.localIP();
   digitalWrite(LED_PIN, LOW);
+  uint32_t ipAddr = Ethernet.localIP();
+  char buf[16];
+  sprintf(buf, "%d.%d.%d.%d", ipAddress.ipArray[0], ipAddress.ipArray[1], ipAddress.ipArray[2], ipAddress.ipArray[3]);
+  LcdString(buf);
+  delay(1000);
 }
 
 
@@ -151,30 +188,36 @@ void loop()
   char temp_as_str[20];
   char hum_combined[40];
   char temp_combined[40];
-
   // Read values from the sensor
-  temp_c = sht1x.readTemperatureC();
-  temp_f = sht1x.readTemperatureF();
-  humidity = sht1x.readHumidity();
 
-  // Print the values to the serial port
-  Serial.print("Temperature: ");
-  Serial.print(temp_c, DEC);
-  Serial.print("C / ");
-  Serial.print(temp_f, DEC);
-  Serial.print("F. Humidity: ");
-  Serial.print(humidity);
-  Serial.println("%");
-  dtostrf(humidity,4,4,stringone);
-  dtostrf(temp_f,4,3,temp_as_str);
-  sprintf(hum_combined, "Hum: %s", stringone);
-  sprintf(temp_combined, "Temp: %s", temp_as_str);
-  LcdClear();
-  gotoXY(1,1);
-  LcdString(hum_combined);
-  LcdString(temp_combined);
-  
-  delay(3000);
+  long inital_time = millis();
+      
+  if (inital_time - prevTime > 60000) {
+    prevTime = millis();
+    // Print the values to the serial port
+    temp_c = sht1x.readTemperatureC();
+    temp_f = sht1x.readTemperatureF();
+    humidity = sht1x.readHumidity();
+    Serial.print("Temperature: ");
+    Serial.print(temp_c, DEC);
+    Serial.print("C / ");
+    Serial.print(temp_f, DEC);
+    Serial.print("F. Humidity: ");
+    Serial.print(humidity);
+    Serial.println("%");
+    dtostrf(humidity,4,4,stringone);
+    dtostrf(temp_f,4,3,temp_as_str);
+    sprintf(hum_combined, "Hum: %s", stringone);
+    sprintf(temp_combined, "Temp: %s", temp_as_str);
+    LcdClear();
+    SetLCDCursor(1,1);
+    LcdString(hum_combined);
+    LcdString(temp_combined);
+    fieldData[0] = temp_as_str;
+    fieldData[1] = stringone;
+    postData();
+  }
+  delay(1000);
 }
 
 
@@ -197,7 +240,7 @@ void LcdClear(void)
   }
 }
 
-void gotoXY(int x, int y)
+void SetLCDCursor(int x, int y)
 {
   LcdWrite( 0, 0x80 | x);  // Column.
   LcdWrite( 0, 0x40 | y);  // Row.  
@@ -231,6 +274,14 @@ void LcdString(char *characters)
   }
 }
 
+void LcdString(unsigned char *characters)
+{
+  while (*characters)
+  {
+    LcdCharacter(*characters++);
+  }
+}
+
 void LcdWrite(byte dc, byte data)
 {
   digitalWrite(PIN_DC, dc);
@@ -238,3 +289,50 @@ void LcdWrite(byte dc, byte data)
   shiftOut(PIN_SDIN, PIN_SCLK, MSBFIRST, data);
   digitalWrite(PIN_SCE, HIGH);
 }
+
+void postData()
+{
+  // Make a TCP connection to remote host
+  if (client.connect(server, 80))
+  {
+    // Post the data! Request should look a little something like:
+    // GET /input/publicKey?private_key=privateKey&light=1024&switch=0&name=Jim HTTP/1.1\n
+    // Host: data.sparkfun.com\n
+    // Connection: close\n
+    // \n
+    client.print("GET /input/");
+    client.print(publicKey);
+    client.print("?private_key=");
+    client.print(privateKey);
+    for (int i=0; i<NUM_FIELDS; i++)
+    {
+      client.print("&");
+      client.print(fieldNames[i]);
+      client.print("=");
+      client.print(fieldData[i]);
+    }
+    client.println(" HTTP/1.1");
+    client.print("Host: ");
+    client.println(server);
+    client.println("Connection: close");
+    client.println();
+  }
+  else
+  {
+    Serial.println(F("Connection failed"));
+  } 
+
+  // Check for a response from the server, and route it
+  // out the serial port.
+  while (client.connected())
+  {
+    if ( client.available() )
+    {
+      char c = client.read();
+      Serial.print(c);
+    }      
+  }
+  Serial.println();
+  client.stop();
+}
+
